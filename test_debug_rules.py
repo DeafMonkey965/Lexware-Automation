@@ -26,9 +26,9 @@ def test_explicit_invoice_markers(marker, separator):
 
 @pytest.mark.parametrize('text', ['Rechnung 12345', 'Kundennummer: 12345', '12345',
                                  'Rechnungsnummer\n\n12345', 'Rechnungsnummer: 09.09.2026',
-                                 'Rechnungsnummer: 2026-09-09', 'Rechnungsnummer: 119,00',
-                                 'Rechnungsnummer: Datum: 12345', 'Rechnungsnummer: ABC',
-                                 'Rechnungsnummer: R-1\nBelegnummer: R-2'])
+                                 'Rechnungsnummer: 10.03.26', 'Rechnungsnummer: 2026-09-09',
+                                 'Rechnungsnummer: 119,00', 'Rechnungsnummer: Datum: 12345',
+                                 'Rechnungsnummer: ABC', 'Rechnungsnummer: R-1\nBelegnummer: R-2'])
 def test_missing_or_ambiguous_number_stays_null(text):
     assert extract_rules(text).invoice_number is None
 
@@ -38,10 +38,10 @@ def test_repeated_number_is_unambiguous():
 
 
 def test_diagnostics_short_date_and_product_percentages():
-    candidates = debug_candidates('10.03.26 15:37:59\nKaese 45% Fett\nMwSt 19 %\nBrutto 119,00')
+    candidates = debug_candidates('10.03.26 15:37:59\nKaese 45% Fett\nMwSt 19,00 %\nBrutto 119,00')
     assert [c['value'] for c in candidates['Datum']] == ['10.03.26']
     assert [c['value'] for c in candidates['Geldbetraege']] == ['119,00']
-    assert [c['value'] for c in candidates['Steuersaetze']] == ['19 %']
+    assert [c['value'] for c in candidates['Steuersaetze']] == ['19,00 %']
 
 
 def test_diagnostic_candidates_share_parser_and_include_context(tmp_path):
@@ -56,6 +56,54 @@ def test_diagnostic_candidates_share_parser_and_include_context(tmp_path):
     assert candidates['Steuersaetze'][0]['value'] == '19 %'
     assert len(candidates['Lieferanten']) == 2
     assert extract_rules(text, registry).supplier == 'Firma GmbH'
+
+
+def test_ocr_short_date_and_noisy_labeled_totals():
+    text = '''Rechnung
+Lieferant: Firma GmbH
+Rechnungsnummer: R-2026-10
+Rechnungsdatum | 10.03.26
+Gesamt Netto .... EUR 100,00
+Gesamt Umsatzsteuer | 19,00 EUR
+Gesamt Brutto .... 119,00 EUR
+Satz Netto MwSt Brutto
+19,00 % 100,00 19,00 119,00
+'''
+    result = extract_rules(text)
+    assert result.date == '2026-03-10'
+    assert result.total_net == 100.0
+    assert result.total_tax == 19.0
+    assert result.total_gross == 119.0
+    assert len(result.tax_groups) == 1
+    assert result.tax_groups[0].rate == 19
+    assert result.tax_groups[0].net == 100.0
+    assert result.tax_groups[0].tax == 19.0
+    assert result.tax_groups[0].gross == 119.0
+
+
+def test_decimal_mixed_tax_rates_are_not_counted_as_money():
+    text = '''Rechnung
+Lieferant: Firma GmbH
+Rechnungsnummer: R-MIX
+Rechnungsdatum: 09.09.2026
+Gesamt Netto: 200,00
+Gesamt Umsatzsteuer: 26,00
+Gesamt Brutto: 226,00 EUR
+Satz Netto MwSt Brutto
+7,00 % 100,00 7,00 107,00
+19,00 % 100,00 19,00 119,00
+'''
+    result = extract_rules(text)
+    assert [(group.rate, group.net, group.tax, group.gross) for group in result.tax_groups] == [
+        (7, 100.0, 7.0, 107.0),
+        (19, 100.0, 19.0, 119.0),
+    ]
+
+
+def test_labeled_total_with_two_money_values_is_not_guessed():
+    result = extract_rules('Rechnung\nGesamt Brutto 119,00 EUR inkl. 19,00 MwSt\n')
+    assert result.total_gross is None
+    assert any('Gesamt Brutto Zeile enthaelt mehrere Betraege' in warning for warning in result.warnings)
 
 
 def test_tiff_page_texts_preserve_failed_page(tmp_path, monkeypatch):

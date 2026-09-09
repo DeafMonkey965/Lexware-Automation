@@ -11,7 +11,8 @@ from preflight import detect_zbon_text
 
 
 MONEY = r"(?<![\d.,])[-+]?(?:\d{1,3}(?:[.\u00a0 ]\d{3})+|\d+)[,.]\d{2}(?!\d)"
-DATE = r"(?:\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})"
+DATE = r"(?:\d{1,2}\.\d{1,2}\.(?:\d{4}|\d{2})|\d{4}-\d{2}-\d{2})"
+TAX_RATE = r"(?<![\d.,])(?:7(?:[.,]0{1,2})?|19(?:[.,]0{1,2})?)\s*%"
 INVOICE_MARKER = (r"\b(?:Rechnungsnummer|Rechnung[ \t]+Nr\.?|Rechnungs[- ]?Nr\.?|"
                   r"Re\.[ \t]*-[ \t]*Nr\.?|Belegnummer|Invoice[ \t]*(?:No\.?|Number)|Gutschriftsnummer)(?!\w)")
 INVOICE_STOPWORDS = {'datum', 'rechnung', 'rechnungsdatum', 'kundennummer', 'kunde',
@@ -41,19 +42,25 @@ def invoice_number_candidates(text: str) -> list[dict]:
 
 
 def debug_candidates(text: str, registry: Path = Path('supplier_rules.json')) -> dict:
-    diagnostic_date = r'(?<!\d)(?:\d{1,2}\.\d{1,2}\.(?:\d{4}|\d{2})|\d{4}-\d{2}-\d{2})(?!\d)'
-    def matches(pattern, exclude_dates=False):
-        dates = [m.span() for m in re.finditer(diagnostic_date, text)] if exclude_dates else []
+    diagnostic_date = rf'(?<!\d){DATE}(?!\d)'
+
+    def matches(pattern, exclude_dates=False, exclude_tax_rates=False):
+        excluded = []
+        if exclude_dates:
+            excluded.extend(m.span() for m in re.finditer(diagnostic_date, text))
+        if exclude_tax_rates:
+            excluded.extend(m.span() for m in re.finditer(TAX_RATE, text, re.I))
         return [dict(value=m.group(), line=text.count('\n', 0, m.start()) + 1,
                      context=text[text.rfind('\n', 0, m.start()) + 1:
                                   text.find('\n', m.end()) if '\n' in text[m.end():] else len(text)])
                 for m in re.finditer(pattern, text, re.I)
-                if not any(start < m.end() and m.start() < end for start, end in dates)]
+                if not any(start < m.end() and m.start() < end for start, end in excluded)]
+
     suppliers, warnings = [], []
     supplier_from_text(text, warnings, registry, candidates=suppliers)
     return {'Rechnungsnummer': invoice_number_candidates(text), 'Datum': matches(diagnostic_date),
-            'Geldbetraege': matches(MONEY, exclude_dates=True),
-            'Steuersaetze': matches(r'(?<![\d.,])(?:7|19)\s*%'),
+            'Geldbetraege': matches(MONEY, exclude_dates=True, exclude_tax_rates=True),
+            'Steuersaetze': matches(TAX_RATE),
             'Prozentangaben_ohne_Steuerbestaetigung': matches(r'(?<![\d.,])\d{1,2}(?:[.,]\d+)?\s*%'),
             'Lieferanten': suppliers, 'Lieferantenwarnungen': warnings}
 
@@ -73,17 +80,41 @@ def unique(values: list, label: str, warnings: list[str]):
 
 
 def labeled_money(text: str, labels: str, warnings: list[str], name: str) -> float | None:
-    # Only explicitly labelled values; never infer totals from the largest number.
-    pattern = rf"^\s*(?:{labels})\s*(?:EUR|€)?\s*[:=]?\s*({MONEY})\s*(?:EUR|€)?\s*$"
-    return unique([amount(m.group(1)) for m in re.finditer(pattern, text, re.I | re.M)], name, warnings)
+    """Read a single explicitly labelled amount from a line.
+
+    OCR often inserts separators such as dots, pipes or currency text between a label and
+    the value. We therefore allow harmless same-line noise, but still refuse to guess if
+    the labelled line contains more than one monetary value.
+    """
+    values = []
+    ambiguous_line = False
+    pattern = re.compile(rf"^\s*(?:{labels})\b(?P<tail>[^\n]*)$", re.I | re.M)
+    for match in pattern.finditer(text):
+        numbers = re.findall(MONEY, match.group('tail'))
+        if len(numbers) == 1:
+            values.append(amount(numbers[0]))
+        elif len(numbers) > 1:
+            ambiguous_line = True
+    if ambiguous_line:
+        warnings.append(f"{name} Zeile enthaelt mehrere Betraege")
+    return unique(values, name, warnings)
+
+
+def _parse_date(raw: str) -> str:
+    if '-' in raw:
+        return datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
+    year = raw.rsplit('.', 1)[-1]
+    return datetime.strptime(raw, "%d.%m.%Y" if len(year) == 4 else "%d.%m.%y").date().isoformat()
 
 
 def labeled_date(text: str, labels: str, warnings: list[str], name: str) -> str | None:
     values = []
-    for match in re.finditer(rf"(?:{labels})\s*:?\s*({DATE})", text, re.I):
+    # Keep matching on the same line and near the explicit label. This tolerates OCR
+    # punctuation such as "Rechnungsdatum | 10.03.26" without scanning unrelated dates.
+    for match in re.finditer(rf"(?:{labels})\b[^\n]{{0,32}}?({DATE})", text, re.I):
         raw = match.group(1)
         try:
-            values.append(datetime.strptime(raw, "%d.%m.%Y" if "." in raw else "%Y-%m-%d").date().isoformat())
+            values.append(_parse_date(raw))
         except ValueError:
             warnings.append(f"{name} ungueltig")
     return unique(values, name, warnings)
@@ -125,30 +156,47 @@ def supplier_from_text(text: str, warnings: list[str], registry: Path, candidate
     return unique([value.strip() for value in values], "Lieferant", warnings)
 
 
+def _tax_rate(value: str) -> int | None:
+    normalized = value.replace('%', '').replace(' ', '').replace(',', '.')
+    try:
+        parsed = Decimal(normalized)
+    except Exception:
+        return None
+    if parsed == Decimal('7'):
+        return 7
+    if parsed == Decimal('19'):
+        return 19
+    return None
+
+
 def tax_groups(text: str, warnings: list[str]) -> list[TaxGroup]:
     groups = []
     # Tables are only interpreted if a header states the column order.
     order = []
     values_by_rate: dict[int, dict[str, list[float]]] = {}
     for line in text.splitlines():
-        if re.search(r"(?:Umsatz|Umsätze|Umsaetze|Restaurant sales)\s*(?:7|19)\s*%", line, re.I):
+        if re.search(rf"(?:Umsatz|Umsätze|Umsaetze|Restaurant sales)\s*{TAX_RATE}", line, re.I):
             continue
         labels = re.findall(r"\b(Netto|Steuer|MwSt|USt|Brutto)\b", line, re.I)
         if len(labels) >= 3 and not re.search(MONEY, line):
             order = ["net" if x.lower() == "netto" else "gross" if x.lower() == "brutto" else "tax" for x in labels]
-        rate_match = re.search(r"(?<!\d)(7|19)\s*%", line)
+        rate_match = re.search(TAX_RATE, line, re.I)
         if not rate_match:
             continue
-        rate = int(rate_match.group(1))
+        rate = _tax_rate(rate_match.group())
+        if rate is None:
+            continue
         values = values_by_rate.setdefault(rate, {"net": [], "tax": [], "gross": []})
+        # Decimal-form rates such as "19,00 %" otherwise look like a money amount.
+        line_without_rate = line[:rate_match.start()] + ' ' + line[rate_match.end():]
         labelled = False
         for label, field in (("Netto", "net"), ("(?:Steuer|MwSt|USt)", "tax"), ("Brutto", "gross")):
-            found = re.search(rf"\b{label}\s*[:=]?\s*({MONEY})", line, re.I)
+            found = re.search(rf"\b{label}\s*[:=]?\s*({MONEY})", line_without_rate, re.I)
             if found:
                 values[field].append(amount(found.group(1)))
                 labelled = True
         if not labelled:
-            numbers = re.findall(MONEY, line)
+            numbers = re.findall(MONEY, line_without_rate)
             if len(numbers) == 3 and len(order) == 3 and len(set(order)) == 3:
                 for field, number in zip(order, numbers):
                     values[field].append(amount(number))
@@ -159,8 +207,8 @@ def tax_groups(text: str, warnings: list[str]) -> list[TaxGroup]:
 
 
 PLATFORM_FIELDS = {
-    "restaurant_7_gross": r"(?:Restaurant[- ]?)?(?:Umsaetze|Umsätze|Umsatz|Restaurant sales)\s*7\s*%\s*(?:Brutto)?",
-    "restaurant_19_gross": r"(?:Restaurant[- ]?)?(?:Umsaetze|Umsätze|Umsatz|Restaurant sales)\s*19\s*%\s*(?:Brutto)?",
+    "restaurant_7_gross": r"(?:Restaurant[- ]?)?(?:Umsaetze|Umsätze|Umsatz|Restaurant sales)\s*7(?:[.,]0{1,2})?\s*%\s*(?:Brutto)?",
+    "restaurant_19_gross": r"(?:Restaurant[- ]?)?(?:Umsaetze|Umsätze|Umsatz|Restaurant sales)\s*19(?:[.,]0{1,2})?\s*%\s*(?:Brutto)?",
     "tips": r"Trinkgeld|Tips",
     "commission_net": r"(?:Provision|Commission)\s*(?:Netto|Net)",
     "commission_tax": r"(?:Provision|Commission)\s*(?:MwSt|USt|Steuer|VAT)",
@@ -190,7 +238,7 @@ def extract_rules(text: str, registry: Path = Path("supplier_rules.json")) -> An
                                    "Rechnungsnummer", warnings)
     result.date = labeled_date(text, r"Rechnungsdatum|Belegdatum|Invoice date", warnings, "Rechnungsdatum")
     result.due_date = labeled_date(text, r"Fällig(?:keit| am)?|Faellig(?:keit| am)?|Zahlbar bis|Due date", warnings, "Faelligkeit")
-    result.total_gross = labeled_money(text, r"Gesamt(?:betrag|\s*Brutto)?|Bruttobetrag|Rechnungsbetrag|Endbetrag|Summe\s*Brutto", warnings, "Gesamt Brutto")
+    result.total_gross = labeled_money(text, r"Gesamt(?:betrag|\s*Brutto)|Bruttobetrag|Rechnungsbetrag|Endbetrag|Summe\s*Brutto", warnings, "Gesamt Brutto")
     result.total_net = labeled_money(text, r"Gesamt\s*Netto|Nettobetrag|Summe\s*Netto|Netto", warnings, "Gesamt Netto")
     result.total_tax = labeled_money(text, r"Gesamt\s*(?:Umsatzsteuer|MwSt|USt|Steuer)|Steuerbetrag|Umsatzsteuer|MwSt|USt", warnings, "Gesamt Umsatzsteuer")
     currencies = re.findall(r"\b(?:EUR|USD|GBP|CHF)\b|€", text)

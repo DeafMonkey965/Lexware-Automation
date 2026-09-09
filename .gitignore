@@ -1,0 +1,13 @@
+.env
+supplier_rules.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-*/
+buchhaltung.db
+output/*.csv
+output/*.html
+cache/*
+!cache/.gitkeep
+debug/images/
+debug/text/

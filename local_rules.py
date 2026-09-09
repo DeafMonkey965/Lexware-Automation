@@ -44,18 +44,22 @@ def invoice_number_candidates(text: str) -> list[dict]:
 def debug_candidates(text: str, registry: Path = Path('supplier_rules.json')) -> dict:
     diagnostic_date = rf'(?<!\d){DATE}(?!\d)'
 
-    def matches(pattern, exclude_dates=False):
-        dates = [m.span() for m in re.finditer(diagnostic_date, text)] if exclude_dates else []
+    def matches(pattern, exclude_dates=False, exclude_tax_rates=False):
+        excluded = []
+        if exclude_dates:
+            excluded.extend(m.span() for m in re.finditer(diagnostic_date, text))
+        if exclude_tax_rates:
+            excluded.extend(m.span() for m in re.finditer(TAX_RATE, text, re.I))
         return [dict(value=m.group(), line=text.count('\n', 0, m.start()) + 1,
                      context=text[text.rfind('\n', 0, m.start()) + 1:
                                   text.find('\n', m.end()) if '\n' in text[m.end():] else len(text)])
                 for m in re.finditer(pattern, text, re.I)
-                if not any(start < m.end() and m.start() < end for start, end in dates)]
+                if not any(start < m.end() and m.start() < end for start, end in excluded)]
 
     suppliers, warnings = [], []
     supplier_from_text(text, warnings, registry, candidates=suppliers)
     return {'Rechnungsnummer': invoice_number_candidates(text), 'Datum': matches(diagnostic_date),
-            'Geldbetraege': matches(MONEY, exclude_dates=True),
+            'Geldbetraege': matches(MONEY, exclude_dates=True, exclude_tax_rates=True),
             'Steuersaetze': matches(TAX_RATE),
             'Prozentangaben_ohne_Steuerbestaetigung': matches(r'(?<![\d.,])\d{1,2}(?:[.,]\d+)?\s*%'),
             'Lieferanten': suppliers, 'Lieferantenwarnungen': warnings}
@@ -234,7 +238,7 @@ def extract_rules(text: str, registry: Path = Path("supplier_rules.json")) -> An
                                    "Rechnungsnummer", warnings)
     result.date = labeled_date(text, r"Rechnungsdatum|Belegdatum|Invoice date", warnings, "Rechnungsdatum")
     result.due_date = labeled_date(text, r"Fällig(?:keit| am)?|Faellig(?:keit| am)?|Zahlbar bis|Due date", warnings, "Faelligkeit")
-    result.total_gross = labeled_money(text, r"Gesamt(?:betrag|\s*Brutto)?|Bruttobetrag|Rechnungsbetrag|Endbetrag|Summe\s*Brutto", warnings, "Gesamt Brutto")
+    result.total_gross = labeled_money(text, r"Gesamt(?:betrag|\s*Brutto)|Bruttobetrag|Rechnungsbetrag|Endbetrag|Summe\s*Brutto", warnings, "Gesamt Brutto")
     result.total_net = labeled_money(text, r"Gesamt\s*Netto|Nettobetrag|Summe\s*Netto|Netto", warnings, "Gesamt Netto")
     result.total_tax = labeled_money(text, r"Gesamt\s*(?:Umsatzsteuer|MwSt|USt|Steuer)|Steuerbetrag|Umsatzsteuer|MwSt|USt", warnings, "Gesamt Umsatzsteuer")
     currencies = re.findall(r"\b(?:EUR|USD|GBP|CHF)\b|€", text)
